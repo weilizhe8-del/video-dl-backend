@@ -162,9 +162,10 @@ def video_info(req: ParseRequest):
 
     # Build options with cookie if provided
     opts = dict(YTDL_OPTS)
-    cookiefile = _make_cookiefile(req.cookie, url)
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
+    http_headers = dict(opts.get("http_headers", {}))
+    if req.cookie and req.cookie.strip():
+        http_headers["Cookie"] = req.cookie.strip()
+    opts["http_headers"] = http_headers
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -179,8 +180,6 @@ def video_info(req: ParseRequest):
         if "Private video" in msg:
             raise HTTPException(400, "该视频为私密视频，无法下载")
         raise HTTPException(502, f"解析失败，请稍后重试：{msg[:120]}")
-    finally:
-        _cleanup_cookiefile(cookiefile)
 
     raw_formats = info.get("formats") or []
     formats = drop_live_chat_formats(raw_formats)
@@ -234,9 +233,10 @@ def video_download(req: DownloadRequest):
 
     # Build options with cookie if provided
     opts = dict(YTDL_OPTS)
-    cookiefile = _make_cookiefile(req.cookie, url)
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
+    http_headers = dict(opts.get("http_headers", {}))
+    if req.cookie and req.cookie.strip():
+        http_headers["Cookie"] = req.cookie.strip()
+    opts["http_headers"] = http_headers
 
     # Try cache first, otherwise re-extract
     info = _cache_get(url)
@@ -245,7 +245,6 @@ def video_download(req: DownloadRequest):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
-            _cleanup_cookiefile(cookiefile)
             raise HTTPException(502, f"获取视频信息失败：{str(e)[:120]}")
 
     dl_url = None
@@ -281,15 +280,12 @@ def video_download(req: DownloadRequest):
         dl_url = target_fmt.get("url")
 
     if not dl_url:
-        _cleanup_cookiefile(cookiefile)
         raise HTTPException(502, "未能获取下载链接，请尝试其他清晰度")
 
     ext = target_fmt.get("ext", "mp4")
     resolution = target_fmt.get("resolution") or target_fmt.get("format_note", "")
     safe_title = re.sub(r'[\\/*?:"<>|]', "_", filename)[:80]
     filename_full = f"{safe_title}_{resolution}.{ext}"
-
-    _cleanup_cookiefile(cookiefile)
 
     return {
         "download_url": dl_url,
