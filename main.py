@@ -169,8 +169,6 @@ def video_info(req: ParseRequest):
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    finally:
-        _cleanup_cookiefile(cookiefile)
     except Exception as e:
         msg = str(e)
         logger.warning(f"Parse failed: {msg}")
@@ -181,6 +179,8 @@ def video_info(req: ParseRequest):
         if "Private video" in msg:
             raise HTTPException(400, "该视频为私密视频，无法下载")
         raise HTTPException(502, f"解析失败，请稍后重试：{msg[:120]}")
+    finally:
+        _cleanup_cookiefile(cookiefile)
 
     raw_formats = info.get("formats") or []
     formats = drop_live_chat_formats(raw_formats)
