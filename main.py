@@ -4,6 +4,7 @@ Parses video links and returns direct download URLs.
 """
 
 import re
+import time
 import logging
 from typing import Optional
 
@@ -24,6 +25,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Simple in-memory cache: {url: (info_dict, expiry_timestamp)}
+_info_cache: dict[str, tuple[dict, float]] = {}
+INFO_CACHE_TTL = 300  # 5 minutes
+
+def _cache_get(url: str) -> dict | None:
+    entry = _info_cache.get(url)
+    if entry and entry[1] > time.time():
+        return entry[0]
+    return None
+
+def _cache_set(url: str, info: dict) -> None:
+    # Clean expired entries
+    now = time.time()
+    expired = [k for k, v in _info_cache.items() if v[1] <= now]
+    for k in expired:
+        del _info_cache[k]
+    _info_cache[url] = (info, now + INFO_CACHE_TTL)
 
 SUPPORTED_DOMAINS = [
     "bilibili.com", "b23.tv",
@@ -137,6 +156,9 @@ def video_info(req: ParseRequest):
 
     format_list.sort(key=lambda x: (x["tbr"] or 0), reverse=True)
 
+    # Cache for later download
+    _cache_set(url, info)
+
     return {
         "title": info.get("title", "未知标题"),
         "duration": info.get("duration") or 0,
@@ -157,11 +179,14 @@ def video_download(req: DownloadRequest):
 
     logger.info(f"Getting download URL: {url} format={format_id}")
 
-    try:
-        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise HTTPException(502, f"获取视频信息失败：{str(e)[:120]}")
+    # Try cache first, otherwise re-extract
+    info = _cache_get(url)
+    if info is None:
+        try:
+            with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            raise HTTPException(502, f"获取视频信息失败：{str(e)[:120]}")
 
     dl_url = None
     filename = info.get("title", "video")
