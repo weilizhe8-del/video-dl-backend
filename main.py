@@ -1,0 +1,203 @@
+"""
+Video Download Backend — FastAPI + yt-dlp
+Parses video links and returns direct download URLs.
+"""
+
+import re
+import logging
+from typing import Optional
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+import yt_dlp
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="video-dl-backend", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SUPPORTED_DOMAINS = [
+    "bilibili.com", "b23.tv",
+    "douyin.com", "tiktok.com",
+    "xiaohongshu.com", "xhslink.com",
+    "weibo.com",
+    "zhihu.com",
+    "ixigua.com",
+    "kuaishou.com",
+    "acfun.cn",
+    "baidu.com",  # 百度短链
+    "bilivideo.com",
+    "v.qq.com",
+    "youku.com",
+    "iqiyi.com",
+    "ted.com",
+    "vimeo.com",
+]
+
+YTDL_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "extract_flat": False,
+    "socket_timeout": 30,
+    "retries": 3,
+}
+
+
+def drop_live_chat_formats(formats: list[dict]) -> list[dict]:
+    """Filter out live chat / non-video entries."""
+    return [
+        f for f in formats
+        if f.get("vcodec") not in (None, "none")
+        and f.get("protocol") not in ("m3u8", "m3u8_native")
+    ]
+
+
+def fmt_filesize(size_bytes: Optional[int]) -> Optional[float]:
+    if size_bytes is None or size_bytes <= 0:
+        return None
+    return round(size_bytes / 1024 / 1024, 1)
+
+
+class ParseRequest(BaseModel):
+    url: str
+
+
+class DownloadRequest(BaseModel):
+    url: str
+    format_id: str
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "yt_dlp_version": yt_dlp.version.__version__}
+
+
+@app.post("/api/info")
+def video_info(req: ParseRequest):
+    url = req.url.strip()
+    if not url:
+        raise HTTPException(400, "请提供视频链接")
+
+    logger.info(f"Parsing: {url}")
+
+    try:
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        msg = str(e)
+        logger.warning(f"Parse failed: {msg}")
+        if "Unsupported URL" in msg:
+            raise HTTPException(400, "不支持的链接格式，请检查后重试")
+        if "Video unavailable" in msg:
+            raise HTTPException(400, "视频不可用，可能已被删除或设为私密")
+        if "Private video" in msg:
+            raise HTTPException(400, "该视频为私密视频，无法下载")
+        raise HTTPException(502, f"解析失败，请稍后重试：{msg[:120]}")
+
+    raw_formats = info.get("formats") or []
+    formats = drop_live_chat_formats(raw_formats)
+
+    # Deduplicate by resolution, keep the best filesize per resolution
+    seen_res = {}
+    best_formats = []
+    for f in formats:
+        res = f.get("resolution") or f.get("format_note") or "unknown"
+        fs = fmt_filesize(f.get("filesize"))
+        key = f"{res}_{f.get('ext','mp4')}"
+        if key not in seen_res or (fs and (seen_res[key][1] is None or fs > seen_res[key][1])):
+            seen_res[key] = (f, fs)
+
+    format_list = []
+    for f, fs in seen_res.values():
+        format_list.append({
+            "format_id": f["format_id"],
+            "resolution": f.get("resolution") or f.get("format_note", "unknown"),
+            "ext": f.get("ext", "mp4"),
+            "filesize_mb": fs,
+            "vcodec": f.get("vcodec", ""),
+            "acodec": f.get("acodec", ""),
+            "tbr": f.get("tbr"),
+        })
+
+    format_list.sort(key=lambda x: (x["tbr"] or 0), reverse=True)
+
+    return {
+        "title": info.get("title", "未知标题"),
+        "duration": info.get("duration") or 0,
+        "thumbnail": info.get("thumbnail") or "",
+        "uploader": info.get("uploader") or info.get("channel") or "未知",
+        "platform": info.get("extractor_key", "").lower(),
+        "webpage_url": info.get("webpage_url", url),
+        "formats": format_list,
+    }
+
+
+@app.post("/api/download")
+def video_download(req: DownloadRequest):
+    url = req.url.strip()
+    format_id = req.format_id.strip()
+    if not url or not format_id:
+        raise HTTPException(400, "缺少必要参数")
+
+    logger.info(f"Getting download URL: {url} format={format_id}")
+
+    try:
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise HTTPException(502, f"获取视频信息失败：{str(e)[:120]}")
+
+    dl_url = None
+    filename = info.get("title", "video")
+
+    target_fmt = None
+    for f in info.get("formats", []):
+        if f.get("format_id") == format_id:
+            target_fmt = f
+            break
+
+    if not target_fmt:
+        raise HTTPException(400, f"未找到清晰度 {format_id}")
+
+    # If format has both video+audio, use it directly
+    has_video = target_fmt.get("vcodec") not in (None, "none")
+    has_audio = target_fmt.get("acodec") not in (None, "none")
+
+    if has_video and has_audio:
+        dl_url = target_fmt.get("url")
+    elif has_video and not has_audio:
+        # Video-only: find best audio format to pair
+        best_audio = None
+        for f in info.get("formats", []):
+            if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none"):
+                if best_audio is None or (f.get("tbr") or 0) > (best_audio.get("tbr") or 0):
+                    best_audio = f
+        if best_audio:
+            dl_url = f"{target_fmt.get('url', '')}+{best_audio.get('url', '')}"
+        else:
+            dl_url = target_fmt.get("url")
+    else:
+        dl_url = target_fmt.get("url")
+
+    if not dl_url:
+        raise HTTPException(502, "未能获取下载链接，请尝试其他清晰度")
+
+    ext = target_fmt.get("ext", "mp4")
+    resolution = target_fmt.get("resolution") or target_fmt.get("format_note", "")
+    safe_title = re.sub(r'[\\/*?:"<>|]', "_", filename)[:80]
+    filename_full = f"{safe_title}_{resolution}.{ext}"
+
+    return {
+        "download_url": dl_url,
+        "filename": filename_full,
+        "is_composite": "+" in str(dl_url),
+    }
